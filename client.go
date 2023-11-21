@@ -30,7 +30,8 @@ type CreateOptions struct {
 	// Namespace is for creating the experiment in a specific namespace.
 	// A namespace is a Kubernetes construct, but is useful for managing
 	// experiments in a multi-tenant environment, running on Kubernetes.
-	Namespace string
+	Namespace           string
+	IgnoreAlreadyExists bool
 }
 
 // ListOptions are options that can be passed to the ListExperiments.
@@ -81,6 +82,12 @@ type IgnoreMissing bool
 
 func (i IgnoreMissing) ApplyToDelete(o *DeleteOptions) {
 	o.IgnoreMissing = bool(i)
+}
+
+type IgnoreAlreadyExists bool
+
+func (i IgnoreAlreadyExists) ApplyToCreate(o *CreateOptions) {
+	o.IgnoreAlreadyExists = bool(i)
 }
 
 // Client is the interface for interacting with the MLFlow API
@@ -167,30 +174,37 @@ func (c *client) CreateExperiment(experiment *Experiment, opts ...CreateOption) 
 	body := res.Body
 	defer body.Close()
 
-	if res.StatusCode != http.StatusOK {
-		var data []byte
-		data, err = io.ReadAll(body)
+	if res.StatusCode == http.StatusOK {
+		var out struct {
+			ExperimentID string `json:"experiment_id"`
+		}
+
+		err = json.NewDecoder(body).Decode(&out)
 		if err != nil {
 			return err
 		}
-		return errors.Errorf("unexpected status code %d: %s", res.StatusCode, string(data))
+
+		experiment.ExperimentID = out.ExperimentID
+		return c.GetExperiment(experiment, InNamespace(o.Namespace))
 	}
 
-	var out struct {
-		ExperimentID string `json:"experiment_id"`
+	if res.StatusCode == http.StatusBadRequest && o.IgnoreAlreadyExists {
+		// this is probably an already exists error, but we can't be sure
+		// because this is what MLflow returns for a conflict error
+		return c.GetExperiment(experiment, InNamespace(o.Namespace))
 	}
 
-	err = json.NewDecoder(body).Decode(&out)
+	var data []byte
+	data, err = io.ReadAll(body)
 	if err != nil {
 		return err
 	}
+	return errors.Errorf("unexpected status code %d: %s", res.StatusCode, string(data))
 
-	experiment.ExperimentID = out.ExperimentID
-	return c.GetExperiment(experiment, InNamespace(o.Namespace))
 }
 
 func (c *client) GetExperiment(experiment *Experiment, opts ...GetOption) error {
-	if experiment.ExperimentID == "" {
+	if experiment.ExperimentID == "" && experiment.Name == "" {
 		return errors.Errorf("ExperimentID must be set")
 	}
 
@@ -208,6 +222,15 @@ func (c *client) GetExperiment(experiment *Experiment, opts ...GetOption) error 
 
 	q := u.Query()
 	q.Set("experiment_id", experiment.ExperimentID)
+
+	if experiment.ExperimentID == "" && experiment.Name != "" {
+		prefix := fmt.Sprintf("%s/", o.Namespace)
+		if !strings.HasPrefix(experiment.Name, prefix) {
+			experiment.Name = prefix + experiment.Name
+		}
+		q = u.Query()
+		q.Set("experiment_name", experiment.Name)
+	}
 	u.RawQuery = q.Encode()
 
 	req, err := http.NewRequest(http.MethodGet, u.String(), nil)
@@ -232,31 +255,33 @@ func (c *client) GetExperiment(experiment *Experiment, opts ...GetOption) error 
 	body := res.Body
 	defer body.Close()
 
-	if res.StatusCode != http.StatusOK {
-		var data []byte
-		data, err = io.ReadAll(body)
+	if res.StatusCode == http.StatusOK {
+
+		var out struct {
+			Experiment `json:"experiment"`
+		}
+
+		err = json.NewDecoder(body).Decode(&out)
 		if err != nil {
 			return err
 		}
-		return errors.Errorf("unexpected status code %d: %s", res.StatusCode, string(data))
+
+		out.DeepCopyInto(experiment)
+		namespace := experiment.Tags.Get("metadata.namespace")
+		if namespace != "" {
+			prefix := fmt.Sprintf("%s/", namespace)
+			experiment.Name = strings.TrimPrefix(experiment.Name, prefix)
+		}
+		return nil
 	}
 
-	var out struct {
-		Experiment `json:"experiment"`
-	}
-
-	err = json.NewDecoder(body).Decode(&out)
+	var data []byte
+	data, err = io.ReadAll(body)
 	if err != nil {
 		return err
 	}
+	return errors.Errorf("unexpected status code %d: %s", res.StatusCode, string(data))
 
-	out.DeepCopyInto(experiment)
-	namespace := experiment.Tags.Get("metadata.namespace")
-	if namespace != "" {
-		prefix := fmt.Sprintf("%s/", namespace)
-		experiment.Name = strings.TrimPrefix(experiment.Name, prefix)
-	}
-	return nil
 }
 
 func (c *client) DeleteExperiment(experiment *Experiment, opts ...DeleteOption) error {

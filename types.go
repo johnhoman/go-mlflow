@@ -54,6 +54,9 @@ func (e *Experiment) DeepCopy() *Experiment {
 // provided Experiment
 func (e *Experiment) DeepCopyInto(out *Experiment) {
 	*out = *e
+	if len(e.Tags) == 0 {
+		return
+	}
 	out.Tags = make(Tags, len(e.Tags))
 	for index := range e.Tags {
 		out.Tags[index] = Tag{
